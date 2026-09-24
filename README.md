@@ -397,7 +397,7 @@ Last local run of that command: **43 passed**.
 
 ---
 
-## Walkthrough talking points
+## Walkthrough
 
 1. The LLM translates; SQLite and statistics compute. That is why “currently open” is **111**, not a guessed paragraph.
 2. Schema is introspected. The PDF column aliases were wrong; the system follows the CSV.
