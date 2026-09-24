@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -12,11 +13,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
+from app.ingestion.loader import QueryTimeoutError
 from app.llm.groq_client import GroqNotConfiguredError, GroqRequestError
 from app.models.schemas import (
     AnomaliesResponse,
     ErrorResponse,
     HealthResponse,
+    MetricsResponse,
     QueryRequest,
     QueryResponse,
     StatsResponse,
@@ -25,13 +28,27 @@ from app.models.schemas import (
 )
 from app.nlquery.sql_guard import SQLGuardError
 from app.nlquery.text_to_sql import QueryTranslationError
+from app.observability import metrics
 from app.services.ticket_service import TicketService
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = "-"
+        return True
+
+
+_request_id_filter = _RequestIdFilter()
+logging.getLogger().addFilter(_request_id_filter)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_request_id_filter)
 
 
 @asynccontextmanager
@@ -49,24 +66,35 @@ app = FastAPI(
     description="NL query + anomaly detection over support tickets.",
     lifespan=lifespan,
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
+async def security_and_observability(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    settings = get_settings()
+    public_paths = {"/health", "/metrics", "/docs", "/openapi.json", "/redoc"}
+    if (
+        settings.api_token
+        and request.method != "OPTIONS"
+        and request.url.path not in public_paths
+    ):
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {settings.api_token}":
+            return JSONResponse(
+                status_code=401,
+                content=ErrorResponse(
+                    error="unauthorized",
+                    detail="Missing or invalid bearer token.",
+                ).model_dump(),
+                headers={"X-Request-ID": request_id},
+            )
+
     started = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - started) * 1000
+    metrics.record_request(response.status_code, elapsed_ms, request.url.path)
+    response.headers["X-Request-ID"] = request_id
     logger.info(
         "method=%s path=%s status=%s latency_ms=%.1f llm=%s",
         request.method,
@@ -74,8 +102,23 @@ async def log_requests(request: Request, call_next):
         response.status_code,
         elapsed_ms,
         request.url.path.startswith("/query"),
+        extra={"request_id": request_id},
     )
     return response
+
+
+def _configure_cors() -> None:
+    settings = get_settings()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
+    )
+
+
+_configure_cors()
 
 
 def _service() -> TicketService:
@@ -85,6 +128,11 @@ def _service() -> TicketService:
 @app.get("/health", response_model=HealthResponse)
 def health():
     return _service().health()
+
+
+@app.get("/metrics", response_model=MetricsResponse)
+def process_metrics():
+    return MetricsResponse(**metrics.snapshot())
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -175,6 +223,14 @@ async def rejected_sql(_, exc: SQLGuardError):
     return JSONResponse(
         status_code=422,
         content=ErrorResponse(error="unsafe_sql", detail=str(exc)).model_dump(),
+    )
+
+
+@app.exception_handler(QueryTimeoutError)
+async def sql_timed_out(_, exc: QueryTimeoutError):
+    return JSONResponse(
+        status_code=504,
+        content=ErrorResponse(error="sql_timeout", detail=str(exc)).model_dump(),
     )
 
 

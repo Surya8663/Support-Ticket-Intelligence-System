@@ -77,6 +77,12 @@ def detect_anomalies(
 def persist_anomalies(conn: sqlite3.Connection, records: list[AnomalyRecord]) -> None:
     conn.execute(f"DROP TABLE IF EXISTS {ANOMALIES_TABLE}")
     conn.execute(ANOMALIES_DDL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_anomalies_type ON anomalies(anomaly_type)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_anomalies_created ON anomalies(created_at)"
+    )
     if records:
         conn.executemany(
             f"""

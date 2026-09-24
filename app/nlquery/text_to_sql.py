@@ -22,11 +22,16 @@ class SQLPlan:
     explanation: str
 
 
-def generate_sql(question: str, schema: SchemaInfo, client: GroqClient) -> SQLPlan:
+def generate_sql(
+    question: str,
+    schema: SchemaInfo,
+    client: GroqClient,
+    max_joins: int = 2,
+) -> SQLPlan:
     system = sql_system_prompt(schema)
     plan = _request_plan(client, system, sql_user_prompt(question))
     try:
-        sql = validate_sql(plan.sql)
+        sql = validate_sql(plan.sql, max_joins=max_joins)
         return SQLPlan(sql=sql, explanation=plan.explanation)
     except SQLGuardError as exc:
         logger.warning("SQL guard rejected first attempt: %s", exc)
@@ -36,7 +41,7 @@ def generate_sql(question: str, schema: SchemaInfo, client: GroqClient) -> SQLPl
             sql_repair_prompt(question, plan.sql, str(exc)),
         )
         try:
-            sql = validate_sql(repaired.sql)
+            sql = validate_sql(repaired.sql, max_joins=max_joins)
         except SQLGuardError as retry_exc:
             raise QueryTranslationError(str(retry_exc)) from retry_exc
         return SQLPlan(sql=sql, explanation=repaired.explanation or plan.explanation)

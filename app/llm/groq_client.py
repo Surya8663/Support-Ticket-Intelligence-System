@@ -6,6 +6,7 @@ import time
 from groq import Groq
 
 from app.config import Settings
+from app.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class GroqClient:
     def complete_json(self, system: str, user: str) -> str:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            started = time.perf_counter()
             try:
                 response = self._client.chat.completions.create(
                     model=self.model,
@@ -48,16 +50,20 @@ class GroqClient:
                 )
                 content = response.choices[0].message.content or ""
                 usage = getattr(response, "usage", None)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                metrics.record_llm(elapsed_ms, failed=False)
                 logger.info(
-                    "Groq call model=%s tokens=%s",
+                    "Groq call model=%s tokens=%s latency_ms=%.1f",
                     self.model,
                     getattr(usage, "total_tokens", None),
+                    elapsed_ms,
                 )
                 return content
             except GroqNotConfiguredError:
                 raise
             except Exception as exc:  # noqa: BLE001 — normalize all provider failures
                 last_error = exc
+                metrics.record_llm((time.perf_counter() - started) * 1000, failed=True)
                 logger.warning("Groq attempt %s failed: %s", attempt + 1, exc)
                 if attempt < self.max_retries:
                     time.sleep(1.5 * (attempt + 1))

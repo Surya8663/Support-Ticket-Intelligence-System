@@ -24,8 +24,20 @@ class Settings(BaseSettings):
     query_result_row_cap: int = 50
     groq_timeout_seconds: float = 30.0
     groq_max_retries: int = 2
+    sql_timeout_seconds: float = 3.0
+    sql_progress_check_every: int = 10_000
+    sql_max_joins: int = 2
+    api_token: str = ""
+    cors_origins: str = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:4173,http://127.0.0.1:4173"
+    )
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
 
 @lru_cache

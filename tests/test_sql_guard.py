@@ -27,6 +27,14 @@ def test_allows_safe_selects(sql):
         "SELECT * FROM tickets -- wipe",
         "PRAGMA table_info(tickets)",
         "WITH x AS (SELECT 1) SELECT * FROM x",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t) SELECT * FROM tickets",
+        "SELECT * FROM sqlite_master",
+        "SELECT * INTO tickets FROM tickets",
+        "SELECT * FROM tickets JOIN anomalies a ON a.ticket_id = tickets.ticket_id "
+        "JOIN anomalies b ON b.ticket_id = tickets.ticket_id "
+        "JOIN anomalies c ON c.ticket_id = tickets.ticket_id",
+        "ALTER TABLE tickets ADD COLUMN x TEXT",
+        "ATTACH DATABASE 'evil.db' AS evil",
     ],
 )
 def test_rejects_unsafe_sql(sql):

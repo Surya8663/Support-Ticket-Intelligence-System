@@ -16,6 +16,8 @@ class HealthResponse(BaseModel):
     groq_configured: bool
     row_count: int
     reference_now: str | None = None
+    auth_required: bool = False
+    sql_timeout_seconds: float | None = None
 
 
 class NumericSummary(BaseModel):
@@ -94,6 +96,12 @@ class QueryRequest(BaseModel):
         return cleaned
 
 
+class QueryTimings(BaseModel):
+    sql_ms: float
+    llm_ms: float
+    total_ms: float
+
+
 class QueryResponse(BaseModel):
     question: str
     answer: str
@@ -101,3 +109,19 @@ class QueryResponse(BaseModel):
     explanation: str
     row_count: int
     rows: list[dict] = Field(default_factory=list)
+    truncated: bool = False
+    timings: QueryTimings | None = None
+
+
+class MetricsResponse(BaseModel):
+    uptime_seconds: float
+    requests_total: int
+    errors_total: int
+    query_total: int
+    query_failures: int
+    sql_timeouts: int
+    llm_calls: int
+    llm_failures: int
+    avg_request_ms: float
+    avg_llm_ms: float
+    avg_sql_ms: float

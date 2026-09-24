@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -98,7 +99,16 @@ def introspect_schema(
     )
 
 
-def connect(db_path: Path, readonly: bool = False) -> sqlite3.Connection:
+class QueryTimeoutError(RuntimeError):
+    """Raised when a generated query exceeds the configured VM budget."""
+
+
+def connect(
+    db_path: Path,
+    readonly: bool = False,
+    timeout_seconds: float | None = None,
+    progress_every: int = 10_000,
+) -> sqlite3.Connection:
     path = Path(db_path)
     if readonly:
         uri = f"{path.resolve().as_uri()}?mode=ro"
@@ -106,6 +116,15 @@ def connect(db_path: Path, readonly: bool = False) -> sqlite3.Connection:
     else:
         conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    if timeout_seconds and timeout_seconds > 0:
+        started = time.monotonic()
+
+        def _watchdog() -> int:
+            if time.monotonic() - started > timeout_seconds:
+                return 1
+            return 0
+
+        conn.set_progress_handler(_watchdog, progress_every)
     return conn
 
 

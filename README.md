@@ -136,8 +136,9 @@ The Groq client uses JSON-mode responses, a timeout, and a bounded retry. The te
 | Method | Path | Auth / LLM | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/health` | none | DB ping, row count, `reference_now`, whether a Groq key is present. No model call. |
+| `GET` | `/metrics` | none | Process counters: request volume, errors, LLM/SQL latency averages. |
 | `GET` | `/stats` | none | Counts by status, priority, category, agent + numeric summaries + anomaly counts. |
-| `GET` | `/tickets` | none | Filterable queue: `status`, `priority`, `category`, `search`, `limit`. |
+| `GET` | `/tickets` | none | Filterable queue: `status`, `priority`, `category`, `agent_id`, `search`, `limit`, `offset`. |
 | `GET` | `/tickets/{id}` | none | One ticket or 404. |
 | `GET` | `/anomalies` | none | `method=iqr\|zscore`, `anomaly_type=all\|resolution_outlier\|sla_breach`. Default IQR is the table written at startup. |
 | `POST` | `/query` | Groq | Body `{"question": "..."}` → `answer`, `sql`, `explanation`, `row_count`, capped `rows`. |
@@ -147,9 +148,11 @@ Errors are always JSON `{"error": "...", "detail": "..."}`:
 | Status | When |
 | --- | --- |
 | `400` | Invalid request (empty question, bad query params) |
+| `401` | `API_TOKEN` is set and the bearer token is missing or wrong |
 | `404` | Unknown `ticket_id` |
 | `422` | Unsafe SQL (not SELECT/WITH, wrong tables, comments, DML) or SQLite execution failure |
 | `503` | Groq key missing, model unavailable, or upstream timeout |
+| `504` | Generated SQL exceeded `SQL_TIMEOUT_SECONDS` |
 
 Interactive contract: http://127.0.0.1:8000/docs
 
@@ -252,6 +255,18 @@ ORDER BY metric_value DESC
 
 Answer: **yes — 6** IQR outliers in that week, including **TKT-108** (119.7h) and **TKT-130** (114.3h).
 
+Adversarial / extra questions used in `tests/test_nl_evaluation.py` (same `reference_now`):
+
+| Question | Expected semantic behavior |
+| --- | --- |
+| How many unresolved critical tickets are there? | Critical + Open/Escalated → **31** |
+| Show high-priority tickets older than 24 hours. | Unresolved High/Critical age > 24h → **80** (same set as SLA) |
+| Which agent has the lowest customer rating? | **AGT-08** (avg **3.48** over 25 rated tickets) |
+| Show unresolved Technical tickets. | Technical + Open/Escalated → **48** |
+| What percentage of tickets are escalated? | 62 / 500 → **12.4%** |
+| What is the average resolution time for Critical tickets? | AVG of non-null Critical resolution times → **10.629h** |
+| How many Billing tickets were resolved in the dataset's latest month? | Billing + Resolved + March 2024 → **34** |
+
 Typical `/query` envelope:
 
 ```json
@@ -295,6 +310,9 @@ Nothing about the 500-row file is hardcoded into prompts as sample answers. Thre
 | `SLA_BREACH_HOURS` | `24` | Unresolved High/Critical age |
 | `IQR_GROUP_BY_CATEGORY` | `true` | Per-category fences so Billing does not use Technical’s spread |
 | `QUERY_RESULT_ROW_CAP` | `50` | Rows returned to the client / second LLM call |
+| `SQL_TIMEOUT_SECONDS` | `3` | Cancels a generated SELECT if the SQLite VM runs too long |
+| `SQL_MAX_JOINS` | `2` | Query-complexity cap in the SQL guard |
+| `API_TOKEN` | empty | Optional `Authorization: Bearer` for `/stats`, `/tickets`, `/query`. `/health` stays public |
 
 Do not commit `.env`. `.env.example` is the template.
 
@@ -304,17 +322,18 @@ Do not commit `.env`. `.env.example` is the template.
 
 ```
 app/
-  main.py                 FastAPI app, CORS, error JSON, lifespan ingest
+  main.py                 FastAPI app, request IDs, optional auth, error JSON
   config.py               pydantic-settings
-  ingestion/              CSV → SQLite, required columns, PRAGMA schema
-  nlquery/                prompts, text-to-SQL, sqlparse guard, summarizer
+  observability.py        process metrics
+  ingestion/              CSV → SQLite, required columns, timed read-only connect
+  nlquery/                prompts, text-to-SQL, sqlparse guard, eval cases
   anomalies/              IQR + SLA detector (no LLM)
-  services/               shared orchestration for API + startup
-  llm/                    Groq client (JSON mode, timeout, retries)
+  services/               SQL-backed stats/queue + guarded query path
+  llm/                    Groq client (JSON mode, timeout, retries, latency)
   models/                 Pydantic response contracts
 web/                      React + Vite + TypeScript console
-  nginx.conf              /api reverse-proxy for Docker
-tests/                    ingest, detector, SQL guard, API
+  nginx.conf              /api reverse-proxy + timeouts for Docker
+tests/                    ingest, detector, SQL guard, NL eval, LLM failures, limits
 data/support_tickets.csv  assessment dataset (500 rows)
 docs/architecture-flowchart.jpg
 docker-compose.yml
@@ -333,19 +352,26 @@ python -m pytest tests -q
 | --- | --- |
 | `tests/test_ingestion.py` | Real column names load; missing columns fail |
 | `tests/test_anomaly_detector.py` | Extreme resolution time is an IQR outlier; SLA is High/Critical + age, not every open ticket |
-| `tests/test_sql_guard.py` | SELECT/WITH on allow-listed tables pass; comments, DML, and unknown tables fail |
+| `tests/test_sql_guard.py` | SELECT/WITH on allow-listed tables pass; comments, DML, catalogs, recursive CTEs, and extra JOINs fail |
+| `tests/test_nl_evaluation.py` | Golden questions: intended SQL semantics and verified numeric results, including NULLs |
+| `tests/test_date_windows.py` | this/last week and this/last month bind to `2024-03-30 18:06:00` |
+| `tests/test_llm_failures.py` | Invalid JSON, missing `sql`, DML, timeout fallback |
+| `tests/test_query_limits.py` | Row cap, SQLite execution timeout, `/metrics` |
+| `tests/test_auth.py` | Optional bearer token; `/health` remains public |
 | `tests/test_api_integration.py` | `/health`, `/stats`, `/anomalies` after ingest; `/query` is structured 200 or honest 503 |
 
 ---
 
 ## Known limitations
 
-- **Text-to-SQL is probabilistic.** Unusual wording can still miss. The one-retry repair helps; generated SQL is always returned so a wrong query is inspectable.
+- **Text-to-SQL is probabilistic.** Unusual wording can still miss. The one-retry repair helps; generated SQL is always returned so a wrong query is inspectable. `tests/test_nl_evaluation.py` locks the *intended* SQL and the numeric result; it does not prove every live Groq wording.
+- **The SQL guard is a read-only safety layer for this prototype**, not a complete sandbox. It allow-lists tables, blocks DML/comments/multiple statements, caps JOINs, and executes on a read-only URI with a VM timeout. Do not describe it as “SQL-injection-proof.”
 - **IQR and the 24h SLA are statistical defaults**, not DOTMappers’ real policy. They are config, not hidden constants.
-- **Groq free-tier rate limits are not queued.** Under burst load, `/query` would need a worker — out of scope for a 24-hour assessment.
-- **No authentication or multi-tenancy.** The query path is read-only SQL, not a substitute for auth.
+- **500-row SQLite + pandas at ingest is appropriate for this file.** Stats and ticket listing are SQL. A production warehouse (Postgres, pagination, no full-table pandas) would be required for hundreds of thousands of tickets.
+- **Groq free-tier rate limits are not queued.** Under burst load, `/query` would need a worker.
+- **Auth is optional.** Set `API_TOKEN` for a bearer gate. There is still no multi-tenancy or per-user isolation.
 - **Anomaly explanations are rule strings**, not LLM write-ups. Detection never depends on Groq.
-- **Row cap is 50.** Wide “show me everything” questions are truncated in the response payload on purpose.
+- **Row cap is 50.** Wide “show me everything” questions are truncated on purpose (`truncated: true`).
 
 ---
 
@@ -354,10 +380,12 @@ python -m pytest tests -q
 1. The LLM translates; SQLite and statistics compute. That is why “currently open” is **111**, not a guessed paragraph.
 2. Schema is introspected. The PDF column aliases were wrong; the system follows the CSV.
 3. “Now” is `MAX(created_at)` because the file is Q1 2024. Relative phrases would be empty against a 2026 clock.
-4. SQL guard + a read-only SQLite URI is defense in depth — even a jailbroken SELECT that tries DML cannot write.
+4. SQL guard + a read-only SQLite URI + a VM timeout is defense in depth. It is not a full production sandbox.
 5. **80** SLA breaches and **22** IQR outliers are reproducible with no API key.
 6. The console is a client. If a number on Overview disagrees with `/stats`, that is a bug in the UI, not a second algorithm.
-7. With more time: Ollama fallback, a query cache, auth, and a Groq queue.
+7. Aggregations for `/stats` and `/tickets` run in SQL. Pandas is used at ingest and for IQR because the file is 500 rows.
+8. `GET /metrics` and `X-Request-ID` exist so a walkthrough can show latency and error counts without a third-party APM.
+9. With more time: Ollama fallback, a query cache, a Groq queue, and a real warehouse.
 
 ---
 

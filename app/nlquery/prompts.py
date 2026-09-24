@@ -22,12 +22,24 @@ Columns:
 
 def date_windows(reference_now: str | None) -> dict[str, str]:
     if not reference_now:
-        return {"reference_now": "", "this_month": "", "week_start": ""}
+        return {
+            "reference_now": "",
+            "this_month": "",
+            "last_month": "",
+            "week_start": "",
+            "last_week_start": "",
+        }
     now = datetime.strptime(reference_now, "%Y-%m-%d %H:%M:%S")
+    if now.month == 1:
+        last_month = f"{now.year - 1}-12"
+    else:
+        last_month = f"{now.year}-{now.month - 1:02d}"
     return {
         "reference_now": reference_now,
         "this_month": now.strftime("%Y-%m"),
+        "last_month": last_month,
         "week_start": (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
+        "last_week_start": (now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -50,7 +62,9 @@ Rules:
 - Relative time MUST use these precomputed windows:
   - reference_now = '{windows['reference_now']}'
   - "this month" / "currently" relative to the dataset: strftime('%Y-%m', created_at) = '{windows['this_month']}'
+  - "last month": strftime('%Y-%m', created_at) = '{windows['last_month']}'
   - "this week": created_at >= '{windows['week_start']}' AND created_at <= '{windows['reference_now']}'
+  - "last week": created_at >= '{windows['last_week_start']}' AND created_at < '{windows['week_start']}'
 - Age in hours: (julianday('{windows['reference_now']}') - julianday(created_at)) * 24.0
 - "Not resolved within N hours" means:
     (status = 'Resolved' AND resolution_time_hrs > N)

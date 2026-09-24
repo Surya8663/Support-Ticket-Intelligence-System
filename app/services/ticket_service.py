@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
 
 from app.anomalies.detector import detect_anomalies, load_anomalies, persist_anomalies
 from app.config import Settings
-from app.ingestion.loader import connect, ingest_tickets
+from app.ingestion.loader import QueryTimeoutError, connect, ingest_tickets
 from app.ingestion.schema import SchemaInfo
 from app.llm.groq_client import GroqClient
 from app.models.schemas import (
@@ -18,12 +19,15 @@ from app.models.schemas import (
     HealthResponse,
     NumericSummary,
     QueryResponse,
+    QueryTimings,
     StatsResponse,
     TicketListResponse,
     TicketOut,
 )
+from app.nlquery.sql_guard import validate_sql
 from app.nlquery.summarizer import summarize_rows
 from app.nlquery.text_to_sql import generate_sql
+from app.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -66,27 +70,42 @@ class TicketService:
             groq_configured=bool(self.settings.groq_api_key),
             row_count=self.schema.row_count if self.schema else 0,
             reference_now=self.schema.reference_now if self.schema else None,
+            auth_required=bool(self.settings.api_token),
+            sql_timeout_seconds=self.settings.sql_timeout_seconds,
         )
 
     def stats(self) -> StatsResponse:
         with self._connect() as conn:
-            tickets = pd.read_sql_query("SELECT * FROM tickets", conn)
+            row_count = int(conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0])
             stored = load_anomalies(conn)
+            resolution = _numeric_from_sql(
+                conn,
+                "resolution_time_hrs",
+                "status = 'Resolved' AND resolution_time_hrs IS NOT NULL",
+            )
+            rating = _numeric_from_sql(
+                conn,
+                "customer_rating",
+                "status = 'Resolved' AND customer_rating IS NOT NULL",
+            )
+            by_status = _group_counts(conn, "status")
+            by_priority = _group_counts(conn, "priority")
+            by_category = _group_counts(conn, "category")
+            by_agent = _group_counts(conn, "agent_id")
 
-        resolved = tickets[tickets["status"] == "Resolved"]
         anomaly_counts = AnomalyCounts(
             resolution_outlier=sum(1 for a in stored if a.anomaly_type == "resolution_outlier"),
             sla_breach=sum(1 for a in stored if a.anomaly_type == "sla_breach"),
         )
         return StatsResponse(
-            row_count=int(len(tickets)),
+            row_count=row_count,
             reference_now=self.schema.reference_now if self.schema else None,
-            by_status=_value_counts(tickets, "status"),
-            by_priority=_value_counts(tickets, "priority"),
-            by_category=_value_counts(tickets, "category"),
-            by_agent=_value_counts(tickets, "agent_id"),
-            resolution_time_hrs=_numeric_summary(resolved["resolution_time_hrs"]),
-            customer_rating=_numeric_summary(resolved["customer_rating"]),
+            by_status=by_status,
+            by_priority=by_priority,
+            by_category=by_category,
+            by_agent=by_agent,
+            resolution_time_hrs=resolution,
+            customer_rating=rating,
             anomaly_counts=anomaly_counts,
         )
 
@@ -139,30 +158,42 @@ class TicketService:
         limit: int = 50,
         offset: int = 0,
     ) -> TicketListResponse:
-        with self._connect(readonly=True) as conn:
-            tickets = pd.read_sql_query("SELECT * FROM tickets", conn)
+        clauses = ["1=1"]
+        params: list[object] = []
         if status:
-            tickets = tickets[tickets["status"] == status]
+            clauses.append("status = ?")
+            params.append(status)
         if priority:
-            tickets = tickets[tickets["priority"] == priority]
+            clauses.append("priority = ?")
+            params.append(priority)
         if category:
-            tickets = tickets[tickets["category"] == category]
+            clauses.append("category = ?")
+            params.append(category)
         if agent_id:
-            tickets = tickets[tickets["agent_id"] == agent_id]
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
         if search:
-            needle = search.lower()
-            tickets = tickets[
-                tickets["ticket_id"].str.lower().str.contains(needle, na=False)
-                | tickets["issue_summary"].str.lower().str.contains(needle, na=False)
-                | tickets["agent_id"].str.lower().str.contains(needle, na=False)
-            ]
-        tickets = tickets.sort_values("created_at", ascending=False)
-        total = int(len(tickets))
-        page = tickets.iloc[offset : offset + limit]
+            clauses.append(
+                "(LOWER(ticket_id) LIKE ? OR LOWER(issue_summary) LIKE ? OR LOWER(agent_id) LIKE ?)"
+            )
+            needle = f"%{search.lower()}%"
+            params.extend([needle, needle, needle])
+        where = " AND ".join(clauses)
+        with self._connect(readonly=True) as conn:
+            total = int(conn.execute(f"SELECT COUNT(*) FROM tickets WHERE {where}", params).fetchone()[0])
+            rows = conn.execute(
+                f"""
+                SELECT * FROM tickets
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
         return TicketListResponse(
-            count=int(len(page)),
+            count=len(rows),
             total=total,
-            tickets=[_ticket_out(row) for row in page.to_dict(orient="records")],
+            tickets=[_ticket_out(dict(row)) for row in rows],
         )
 
     def get_ticket(self, ticket_id: str) -> TicketOut | None:
@@ -175,32 +206,68 @@ class TicketService:
     def query(self, question: str) -> QueryResponse:
         if self.schema is None:
             raise RuntimeError("Service has not been started.")
+        started = time.perf_counter()
         client = GroqClient(self.settings)
-        plan = generate_sql(question, self.schema, client)
-        logger.info("Generated SQL for query: %s", plan.sql)
-        rows, row_count = self._execute_select(plan.sql)
-        answer = summarize_rows(question, plan.sql, row_count, rows, client)
+        plan = generate_sql(
+            question,
+            self.schema,
+            client,
+            max_joins=self.settings.sql_max_joins,
+        )
+        sql = validate_sql(plan.sql, max_joins=self.settings.sql_max_joins)
+        logger.info("Generated SQL for query: %s", sql)
+        rows, row_count, sql_ms = self._execute_select(sql)
+        answer = summarize_rows(question, sql, row_count, rows, client)
+        total_ms = (time.perf_counter() - started) * 1000
+        llm_ms = max(total_ms - sql_ms, 0.0)
         return QueryResponse(
             question=question,
             answer=answer,
-            sql=plan.sql,
+            sql=sql,
             explanation=plan.explanation,
             row_count=row_count,
             rows=rows,
+            truncated=row_count > len(rows),
+            timings=QueryTimings(
+                sql_ms=round(sql_ms, 2),
+                llm_ms=round(llm_ms, 2),
+                total_ms=round(total_ms, 2),
+            ),
         )
 
-    def _execute_select(self, sql: str) -> tuple[list[dict], int]:
+    def _execute_select(self, sql: str) -> tuple[list[dict], int, float]:
         cap = self.settings.query_result_row_cap
-        with self._connect(readonly=True) as conn:
-            cursor = conn.execute(sql)
-            columns = [col[0] for col in cursor.description] if cursor.description else []
-            fetched = cursor.fetchall()
+        started = time.perf_counter()
+        timed_out = False
+        try:
+            with self._connect(
+                readonly=True,
+                timeout_seconds=self.settings.sql_timeout_seconds,
+            ) as conn:
+                cursor = conn.execute(sql)
+                columns = [col[0] for col in cursor.description] if cursor.description else []
+                fetched = cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            timed_out = "interrupt" in str(exc).lower()
+            metrics.record_sql((time.perf_counter() - started) * 1000, timed_out=timed_out)
+            if timed_out:
+                raise QueryTimeoutError(
+                    f"Query exceeded {self.settings.sql_timeout_seconds:.1f}s and was cancelled."
+                ) from exc
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        metrics.record_sql(elapsed_ms, timed_out=False)
         row_count = len(fetched)
         rows = [_stringify_row(columns, row) for row in fetched[:cap]]
-        return rows, row_count
+        return rows, row_count, elapsed_ms
 
-    def _connect(self, readonly: bool = True) -> sqlite3.Connection:
-        return connect(self.settings.db_path, readonly=readonly)
+    def _connect(self, readonly: bool = True, timeout_seconds: float | None = None) -> sqlite3.Connection:
+        return connect(
+            self.settings.db_path,
+            readonly=readonly,
+            timeout_seconds=timeout_seconds,
+            progress_every=self.settings.sql_progress_check_every,
+        )
 
 
 def _ticket_out(row: dict) -> TicketOut:
@@ -224,8 +291,38 @@ def _optional_float(value) -> float | None:
     return float(value)
 
 
-def _value_counts(df: pd.DataFrame, column: str) -> dict[str, int]:
-    return {str(k): int(v) for k, v in df[column].value_counts().items()}
+def _group_counts(conn: sqlite3.Connection, column: str) -> dict[str, int]:
+    rows = conn.execute(f"SELECT {column}, COUNT(*) AS n FROM tickets GROUP BY {column}").fetchall()
+    return {str(row[0]): int(row[1]) for row in rows}
+
+
+def _numeric_from_sql(conn: sqlite3.Connection, column: str, where: str) -> NumericSummary:
+    stats = conn.execute(
+        f"SELECT COUNT({column}), AVG({column}), MIN({column}), MAX({column}) FROM tickets WHERE {where}"
+    ).fetchone()
+    count = int(stats[0] or 0)
+    if count == 0:
+        return NumericSummary(count=0)
+    median_row = conn.execute(
+        f"""
+        SELECT AVG({column}) FROM (
+            SELECT {column} FROM tickets
+            WHERE {where}
+            ORDER BY {column}
+            LIMIT 2 - (SELECT COUNT({column}) FROM tickets WHERE {where}) % 2
+            OFFSET (
+                SELECT (COUNT({column}) - 1) / 2 FROM tickets WHERE {where}
+            )
+        )
+        """
+    ).fetchone()
+    return NumericSummary(
+        count=count,
+        mean=round(float(stats[1]), 3),
+        median=round(float(median_row[0]), 3) if median_row and median_row[0] is not None else None,
+        min=round(float(stats[2]), 3),
+        max=round(float(stats[3]), 3),
+    )
 
 
 def _stringify_row(columns: list[str], row: sqlite3.Row | tuple) -> dict:
@@ -239,16 +336,3 @@ def _json_safe(value):
     if isinstance(value, (int, float, str, bool)):
         return value
     return str(value)
-
-
-def _numeric_summary(series: pd.Series) -> NumericSummary:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return NumericSummary(count=0)
-    return NumericSummary(
-        count=int(clean.count()),
-        mean=round(float(clean.mean()), 3),
-        median=round(float(clean.median()), 3),
-        min=round(float(clean.min()), 3),
-        max=round(float(clean.max()), 3),
-    )

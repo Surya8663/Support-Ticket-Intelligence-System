@@ -35,6 +35,10 @@ def test_health_stats_and_anomalies():
         missing = client.get("/tickets/TKT-99999")
         assert missing.status_code == 404
 
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "query_total" in metrics.json()
+
 
 def test_query_is_structured_or_reports_missing_key():
     with TestClient(app) as client:
