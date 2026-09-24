@@ -9,6 +9,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY ui ./ui
+COPY .streamlit ./.streamlit
 COPY data/support_tickets.csv ./data/support_tickets.csv
 
 EXPOSE 8000

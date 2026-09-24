@@ -8,8 +8,9 @@ The LLM is a **translation layer, not a compute engine**. Groq turns a question 
 | --- | --- | --- |
 | Groq (`openai/gpt-oss-20b`) | Text-to-SQL + a short explanation of the rows | The source of counts, averages, or anomaly flags |
 | SQLite | Source of truth after ingest | A write surface for the query path |
-| FastAPI | REST contract + startup orchestration | A place that re-implements React logic |
-| React console | HTTP client over `/api/*` | A second copy of the business rules |
+| FastAPI | REST contract + startup orchestration | A place that re-implements UI logic |
+| Streamlit (`ui/`) | Python UI named in the brief | A second copy of the business rules |
+| React console | Optional HTTP client over `/api/*` | Required for the Python-only clause |
 
 ---
 
@@ -44,13 +45,16 @@ docker compose up --build
 
 | Surface | URL |
 | --- | --- |
-| Operations console | http://127.0.0.1:5173 |
+| Streamlit (Python UI) | http://127.0.0.1:8501 |
+| React console (optional extra) | http://127.0.0.1:5173 |
 | OpenAPI docs | http://127.0.0.1:8000/docs |
 | Health | http://127.0.0.1:8000/health |
 
 Compose reads `GROQ_API_KEY` from a local `.env` if present. The stack still starts without a key; natural-language query returns HTTP 503 with a structured error.
 
-### Local — two terminals
+### Local — Python only (what the brief names)
+
+From a clean folder this is **four commands**, then one process:
 
 ```bash
 python -m venv .venv
@@ -59,19 +63,29 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
+Add `GROQ_API_KEY` to `.env`, then pick one:
+
+```bash
+streamlit run ui/streamlit_app.py
+```
+
+http://127.0.0.1:8501 — Overview, Ask, Anomalies, Ticket queue. Same `TicketService` as FastAPI.
+
 ```bash
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+http://127.0.0.1:8000/docs — REST API.
+
+The brief’s **single command** is Docker above. Local setup is not one command unless the venv already exists; then it is one (`streamlit run` or `uvicorn`).
+
+Optional React console (not required for the Python-only clause):
+
 ```bash
 cd web
-npm install
+npm ci
 npm run dev
 ```
-
-The Vite dev server proxies `/api/*` to `http://127.0.0.1:8000`. Open http://127.0.0.1:5173.
-
-On macOS / Linux, activate the venv with `source .venv/bin/activate` and copy the env file with `cp .env.example .env`.
 
 ```bash
 python -m pytest tests -q
@@ -284,7 +298,9 @@ Typical `/query` envelope:
 
 ## Operations console
 
-Light-theme React console. Every page is an HTTP client; no analytics are recomputed in the browser.
+**Streamlit** (`ui/streamlit_app.py`) is the Python UI the brief lists (Streamlit / Gradio). It calls `TicketService` in-process: Overview, Ask, Anomalies, Ticket queue.
+
+**React** is an optional extra console. Every React page is an HTTP client; no analytics are recomputed in the browser.
 
 | Page | Route | What you can do |
 | --- | --- | --- |
@@ -334,7 +350,8 @@ app/
   services/               SQL-backed stats/queue + guarded query path
   llm/                    Groq client (JSON mode, timeout, retries, latency)
   models/                 Pydantic response contracts
-web/                      React + Vite + TypeScript console
+ui/                       Streamlit Python UI (same TicketService)
+web/                      optional React + Vite console
   nginx.conf              /api reverse-proxy + timeouts for Docker
 tests/                    ingest, detector, SQL guard, NL eval, LLM failures, limits
 data/support_tickets.csv  assessment dataset (500 rows)
