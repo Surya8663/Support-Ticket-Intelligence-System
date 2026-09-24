@@ -32,8 +32,6 @@ class Settings(BaseSettings):
         "http://localhost:5173,http://127.0.0.1:5173,"
         "http://localhost:4173,http://127.0.0.1:4173"
     )
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
 
     @property
     def cors_origin_list(self) -> list[str]:

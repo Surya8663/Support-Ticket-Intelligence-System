@@ -99,6 +99,8 @@ class QueryRequest(BaseModel):
 class QueryTimings(BaseModel):
     sql_ms: float
     llm_ms: float
+    text_to_sql_ms: float = 0.0
+    summary_ms: float = 0.0
     total_ms: float
 
 
@@ -120,6 +122,7 @@ class MetricsResponse(BaseModel):
     query_total: int
     query_failures: int
     sql_timeouts: int
+    sql_executions: int = 0
     llm_calls: int
     llm_failures: int
     avg_request_ms: float

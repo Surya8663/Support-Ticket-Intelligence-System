@@ -19,6 +19,7 @@ class MetricsRegistry:
     llm_calls: int = 0
     llm_failures: int = 0
     llm_ms_total: float = 0.0
+    sql_executions: int = 0
     sql_ms_total: float = 0.0
     _latencies_ms: deque[float] = field(default_factory=lambda: deque(maxlen=200))
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -43,6 +44,7 @@ class MetricsRegistry:
 
     def record_sql(self, latency_ms: float, timed_out: bool = False) -> None:
         with self._lock:
+            self.sql_executions += 1
             self.sql_ms_total += latency_ms
             if timed_out:
                 self.sql_timeouts += 1
@@ -51,19 +53,20 @@ class MetricsRegistry:
         with self._lock:
             samples = list(self._latencies_ms)
             llm_calls = self.llm_calls
-            query_total = self.query_total
+            sql_executions = self.sql_executions
             return {
                 "uptime_seconds": round(time.time() - self.started_at, 1),
                 "requests_total": self.requests_total,
                 "errors_total": self.errors_total,
-                "query_total": query_total,
+                "query_total": self.query_total,
                 "query_failures": self.query_failures,
                 "sql_timeouts": self.sql_timeouts,
+                "sql_executions": sql_executions,
                 "llm_calls": llm_calls,
                 "llm_failures": self.llm_failures,
                 "avg_request_ms": round(sum(samples) / len(samples), 2) if samples else 0.0,
                 "avg_llm_ms": round(self.llm_ms_total / llm_calls, 2) if llm_calls else 0.0,
-                "avg_sql_ms": round(self.sql_ms_total / query_total, 2) if query_total else 0.0,
+                "avg_sql_ms": round(self.sql_ms_total / sql_executions, 2) if sql_executions else 0.0,
             }
 
 

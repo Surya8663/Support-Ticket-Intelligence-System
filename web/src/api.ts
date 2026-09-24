@@ -1,14 +1,21 @@
 import type { Anomaly, ApiError, Health, QueryResult, Stats, Ticket } from "./types";
 
 const base = import.meta.env.VITE_API_BASE_URL ?? "/api";
+const token = (import.meta.env.VITE_API_TOKEN ?? "").trim();
+
+function headers(init?: RequestInit): HeadersInit {
+  const extra = new Headers(init?.headers);
+  extra.set("Content-Type", "application/json");
+  if (token) {
+    extra.set("Authorization", `Bearer ${token}`);
+  }
+  return extra;
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${base}${path}`, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
+    headers: headers(init),
   });
   const payload = (await response.json().catch(() => ({}))) as T & ApiError;
   if (!response.ok) {

@@ -308,13 +308,16 @@ Nothing about the 500-row file is hardcoded into prompts as sample answers. Thre
 | `IQR_MULTIPLIER` | `1.5` | Tukey fence |
 | `ZSCORE_THRESHOLD` | `3.0` | `/anomalies?method=zscore` |
 | `SLA_BREACH_HOURS` | `24` | Unresolved High/Critical age |
-| `IQR_GROUP_BY_CATEGORY` | `true` | Per-category fences so Billing does not use Technical’s spread |
-| `QUERY_RESULT_ROW_CAP` | `50` | Rows returned to the client / second LLM call |
+| `IQR_GROUP_BY_CATEGORY` | `true` | Per-category IQR fences. `false` uses one fence over all resolved tickets |
+| `QUERY_RESULT_ROW_CAP` | `50` | SQLite returns at most cap+1 rows; the 51st row only marks truncation |
 | `SQL_TIMEOUT_SECONDS` | `3` | Cancels a generated SELECT if the SQLite VM runs too long |
 | `SQL_MAX_JOINS` | `2` | Query-complexity cap in the SQL guard |
 | `API_TOKEN` | empty | Optional `Authorization: Bearer` for `/stats`, `/tickets`, `/query`. `/health` stays public |
+| `VITE_API_TOKEN` | empty | Same token for the React console. Leave empty when `API_TOKEN` is empty |
+| `VITE_API_BASE_URL` | `/api` | Browser API prefix (Vite/nginx rewrite) |
+| `CORS_ORIGINS` | local Vite/preview | Comma-separated browser origins |
 
-Do not commit `.env`. `.env.example` is the template.
+Do not commit `.env`. `.env.example` is the template. If you set `API_TOKEN`, set `VITE_API_TOKEN` to the same value (Compose passes `API_TOKEN` into the web build when `VITE_API_TOKEN` is unset).
 
 ---
 
@@ -348,15 +351,17 @@ Dockerfile
 python -m pytest tests -q
 ```
 
+Last local run of that command: **43 passed**.
+
 | File | What it locks in |
 | --- | --- |
 | `tests/test_ingestion.py` | Real column names load; missing columns fail |
-| `tests/test_anomaly_detector.py` | Extreme resolution time is an IQR outlier; SLA is High/Critical + age, not every open ticket |
+| `tests/test_anomaly_detector.py` | Extreme resolution time is an IQR outlier; SLA is High/Critical + age; `IQR_GROUP_BY_CATEGORY` true vs false changes the outlier set |
 | `tests/test_sql_guard.py` | SELECT/WITH on allow-listed tables pass; comments, DML, catalogs, recursive CTEs, and extra JOINs fail |
 | `tests/test_nl_evaluation.py` | Golden questions: intended SQL semantics and verified numeric results, including NULLs |
 | `tests/test_date_windows.py` | this/last week and this/last month bind to `2024-03-30 18:06:00` |
 | `tests/test_llm_failures.py` | Invalid JSON, missing `sql`, DML, timeout fallback |
-| `tests/test_query_limits.py` | Row cap, SQLite execution timeout, `/metrics` |
+| `tests/test_query_limits.py` | Row cap, bounded `fetchmany` (no `fetchall`), SQLite timeout, `/metrics` |
 | `tests/test_auth.py` | Optional bearer token; `/health` remains public |
 | `tests/test_api_integration.py` | `/health`, `/stats`, `/anomalies` after ingest; `/query` is structured 200 or honest 503 |
 
@@ -369,9 +374,9 @@ python -m pytest tests -q
 - **IQR and the 24h SLA are statistical defaults**, not DOTMappers’ real policy. They are config, not hidden constants.
 - **500-row SQLite + pandas at ingest is appropriate for this file.** Stats and ticket listing are SQL. A production warehouse (Postgres, pagination, no full-table pandas) would be required for hundreds of thousands of tickets.
 - **Groq free-tier rate limits are not queued.** Under burst load, `/query` would need a worker.
-- **Auth is optional.** Set `API_TOKEN` for a bearer gate. There is still no multi-tenancy or per-user isolation.
+- **Auth is optional.** Set `API_TOKEN` and `VITE_API_TOKEN` together. There is still no multi-tenancy or per-user isolation.
 - **Anomaly explanations are rule strings**, not LLM write-ups. Detection never depends on Groq.
-- **Row cap is 50.** Wide “show me everything” questions are truncated on purpose (`truncated: true`).
+- **Row cap is 50.** Generated SELECTs are wrapped with `LIMIT cap+1` and read with `fetchmany`. The exact match count uses `COUNT(*)` of the original SELECT so Python never holds the full result set.
 
 ---
 

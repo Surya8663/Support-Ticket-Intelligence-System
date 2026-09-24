@@ -65,10 +65,11 @@ def detect_anomalies(
     z_thresh = settings.zscore_threshold if zscore_threshold is None else zscore_threshold
     sla_hours = settings.sla_breach_hours if sla_breach_hours is None else sla_breach_hours
 
+    group_by_category = settings.iqr_group_by_category
     outliers = (
-        _resolution_iqr(df, k)
+        _resolution_iqr(df, k, group_by_category)
         if method == "iqr"
-        else _resolution_zscore(df, z_thresh)
+        else _resolution_zscore(df, z_thresh, group_by_category)
     )
     breaches = _sla_breaches(df, now, sla_hours)
     return outliers + breaches
@@ -119,18 +120,25 @@ def load_anomalies(conn: sqlite3.Connection) -> list[AnomalyRecord]:
     ]
 
 
-def _resolution_iqr(df: pd.DataFrame, k: float) -> list[AnomalyRecord]:
+def _resolution_groups(resolved: pd.DataFrame, group_by_category: bool):
+    if group_by_category:
+        return resolved.groupby("category", dropna=False)
+    return (("all resolved tickets", resolved),)
+
+
+def _resolution_iqr(df: pd.DataFrame, k: float, group_by_category: bool) -> list[AnomalyRecord]:
     resolved = df[df["status"] == "Resolved"].dropna(subset=["resolution_time_hrs"])
     if resolved.empty:
         return []
 
     records: list[AnomalyRecord] = []
-    for category, group in resolved.groupby("category", dropna=False):
+    for category, group in _resolution_groups(resolved, group_by_category):
         bounds = _iqr_bounds(group["resolution_time_hrs"], k)
         if bounds is None:
             continue
-        lower, upper, q1, q3, iqr = bounds
+        _lower, upper, q1, q3, iqr = bounds
         flagged = group[group["resolution_time_hrs"] > upper]
+        scope = str(category)
         for row in flagged.itertuples(index=False):
             value = float(row.resolution_time_hrs)
             records.append(
@@ -140,7 +148,7 @@ def _resolution_iqr(df: pd.DataFrame, k: float) -> list[AnomalyRecord]:
                     threshold=upper,
                     reason=(
                         f"Resolution time {value:.1f}h is above the IQR upper fence "
-                        f"{upper:.1f}h for {category} tickets "
+                        f"{upper:.1f}h for {scope} "
                         f"(Q1={q1:.1f}, Q3={q3:.1f}, IQR={iqr:.1f}, k={k})."
                     ),
                 )
@@ -148,13 +156,15 @@ def _resolution_iqr(df: pd.DataFrame, k: float) -> list[AnomalyRecord]:
     return records
 
 
-def _resolution_zscore(df: pd.DataFrame, threshold: float) -> list[AnomalyRecord]:
+def _resolution_zscore(
+    df: pd.DataFrame, threshold: float, group_by_category: bool
+) -> list[AnomalyRecord]:
     resolved = df[df["status"] == "Resolved"].dropna(subset=["resolution_time_hrs"])
     if resolved.empty:
         return []
 
     records: list[AnomalyRecord] = []
-    for category, group in resolved.groupby("category", dropna=False):
+    for category, group in _resolution_groups(resolved, group_by_category):
         values = group["resolution_time_hrs"]
         std = float(values.std(ddof=0))
         if std == 0 or pd.isna(std):
@@ -162,6 +172,7 @@ def _resolution_zscore(df: pd.DataFrame, threshold: float) -> list[AnomalyRecord
         mean = float(values.mean())
         z = (values - mean) / std
         flagged = group[z.abs() > threshold]
+        scope = str(category)
         for row in flagged.itertuples(index=False):
             value = float(row.resolution_time_hrs)
             score = abs((value - mean) / std)
@@ -172,7 +183,7 @@ def _resolution_zscore(df: pd.DataFrame, threshold: float) -> list[AnomalyRecord
                     threshold=threshold,
                     reason=(
                         f"Resolution time {value:.1f}h has |z|={score:.2f} "
-                        f"(threshold {threshold}) within {category} tickets "
+                        f"(threshold {threshold}) within {scope} "
                         f"(mean={mean:.1f}h)."
                     ),
                 )

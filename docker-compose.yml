@@ -9,10 +9,12 @@ services:
       GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
       CSV_PATH: data/support_tickets.csv
       DB_PATH: data/tickets.db
+      IQR_GROUP_BY_CATEGORY: ${IQR_GROUP_BY_CATEGORY:-true}
       QUERY_RESULT_ROW_CAP: ${QUERY_RESULT_ROW_CAP:-50}
       SQL_TIMEOUT_SECONDS: ${SQL_TIMEOUT_SECONDS:-3}
       SQL_MAX_JOINS: ${SQL_MAX_JOINS:-2}
       API_TOKEN: ${API_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173}
     healthcheck:
       test:
         [
@@ -27,7 +29,11 @@ services:
       start_period: 20s
 
   web:
-    build: ./web
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_API_TOKEN: ${VITE_API_TOKEN:-${API_TOKEN:-}}
     ports:
       - "5173:80"
     depends_on:

@@ -24,6 +24,7 @@ from app.models.schemas import (
     TicketListResponse,
     TicketOut,
 )
+from app.nlquery.result_limit import bound_select, count_select
 from app.nlquery.sql_guard import validate_sql
 from app.nlquery.summarizer import summarize_rows
 from app.nlquery.text_to_sql import generate_sql
@@ -214,12 +215,14 @@ class TicketService:
             client,
             max_joins=self.settings.sql_max_joins,
         )
+        text_to_sql_ms = (time.perf_counter() - started) * 1000
         sql = validate_sql(plan.sql, max_joins=self.settings.sql_max_joins)
         logger.info("Generated SQL for query: %s", sql)
         rows, row_count, sql_ms = self._execute_select(sql)
+        summary_started = time.perf_counter()
         answer = summarize_rows(question, sql, row_count, rows, client)
+        summary_ms = (time.perf_counter() - summary_started) * 1000
         total_ms = (time.perf_counter() - started) * 1000
-        llm_ms = max(total_ms - sql_ms, 0.0)
         return QueryResponse(
             question=question,
             answer=answer,
@@ -230,23 +233,26 @@ class TicketService:
             truncated=row_count > len(rows),
             timings=QueryTimings(
                 sql_ms=round(sql_ms, 2),
-                llm_ms=round(llm_ms, 2),
+                llm_ms=round(text_to_sql_ms + summary_ms, 2),
+                text_to_sql_ms=round(text_to_sql_ms, 2),
+                summary_ms=round(summary_ms, 2),
                 total_ms=round(total_ms, 2),
             ),
         )
 
     def _execute_select(self, sql: str) -> tuple[list[dict], int, float]:
         cap = self.settings.query_result_row_cap
+        fetch_limit = cap + 1
+        bounded_sql = bound_select(sql, fetch_limit)
         started = time.perf_counter()
-        timed_out = False
         try:
             with self._connect(
                 readonly=True,
                 timeout_seconds=self.settings.sql_timeout_seconds,
             ) as conn:
-                cursor = conn.execute(sql)
+                cursor = conn.execute(bounded_sql)
                 columns = [col[0] for col in cursor.description] if cursor.description else []
-                fetched = cursor.fetchall()
+                fetched = cursor.fetchmany(fetch_limit)
         except sqlite3.OperationalError as exc:
             timed_out = "interrupt" in str(exc).lower()
             metrics.record_sql((time.perf_counter() - started) * 1000, timed_out=timed_out)
@@ -257,9 +263,21 @@ class TicketService:
             raise
         elapsed_ms = (time.perf_counter() - started) * 1000
         metrics.record_sql(elapsed_ms, timed_out=False)
-        row_count = len(fetched)
+        truncated = len(fetched) > cap
         rows = [_stringify_row(columns, row) for row in fetched[:cap]]
+        if truncated:
+            row_count = self._count_matches(sql)
+        else:
+            row_count = len(fetched)
         return rows, row_count, elapsed_ms
+
+    def _count_matches(self, sql: str) -> int:
+        with self._connect(
+            readonly=True,
+            timeout_seconds=self.settings.sql_timeout_seconds,
+        ) as conn:
+            row = conn.execute(count_select(sql)).fetchone()
+        return int(row[0]) if row else 0
 
     def _connect(self, readonly: bool = True, timeout_seconds: float | None = None) -> sqlite3.Connection:
         return connect(
