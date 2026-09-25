@@ -10,7 +10,7 @@ The LLM is a **translation layer, not a compute engine**. Groq turns a question 
 | SQLite | Source of truth after ingest | A write surface for the query path |
 | FastAPI | REST contract + startup orchestration | A place that re-implements UI logic |
 | Streamlit (`ui/`) | Python UI named in the brief | A second copy of the business rules |
-| React console | Optional HTTP client over `/api/*` | Required for the Python-only clause |
+| React console | Optional extra HTTP client over `/api/*` | Not required for the Python-only path |
 
 ---
 
@@ -95,7 +95,7 @@ python -m pytest tests -q
 
 ## How it works
 
-End-to-end flow: CSV ingest and schema introspection, statistical anomaly detection with no LLM, FastAPI surfaces, the React console, and the guarded text-to-SQL path.
+End-to-end flow: CSV ingest and schema introspection, statistical anomaly detection with no LLM, FastAPI surfaces, the Streamlit Python UI (React is optional), and the guarded text-to-SQL path.
 
 ![Support Ticket Analytics — How It Works](docs/architecture-flowchart.jpg)
 
@@ -103,7 +103,7 @@ End-to-end flow: CSV ingest and schema introspection, statistical anomaly detect
 
 1. **Data initialization** — on startup the CSV is validated against the ten real column names, dates and numbers are coerced, `tickets` is replaced in SQLite, schema is introspected with `PRAGMA`, and `reference_now` is set to `MAX(created_at)` = `2024-03-30 18:06:00`.
 2. **Anomaly detection (no LLM)** — IQR per category on resolved `resolution_time_hrs`, plus SLA breaches (unresolved High/Critical older than 24h). Results are written to an `anomalies` table so the API and console can read them.
-3. **React console** — Overview, Ask the data, Anomalies, and Ticket queue. The browser only calls `/api/*` (Vite or nginx strip the prefix).
+3. **UIs** — Streamlit is the Python console (`ui/streamlit_app.py`). The React console is optional and only calls `/api/*`.
 4. **FastAPI** — `/health`, `/stats`, `/tickets`, `/tickets/{id}`, `/anomalies` (cached IQR or live IQR/z-score), and `POST /query`.
 5. **Query path** — if a Groq key is missing, 503. Otherwise Groq returns JSON `{sql, explanation}`, the guard allows only `SELECT`/`WITH` on `tickets`/`anomalies`, SQLite runs read-only, and Groq writes the answer from the rows. Unsafe or unexecutable SQL is 422, never silent.
 
@@ -328,12 +328,12 @@ Nothing about the 500-row file is hardcoded into prompts as sample answers. Thre
 | `QUERY_RESULT_ROW_CAP` | `50` | SQLite returns at most cap+1 rows; the 51st row only marks truncation |
 | `SQL_TIMEOUT_SECONDS` | `3` | Cancels a generated SELECT if the SQLite VM runs too long |
 | `SQL_MAX_JOINS` | `2` | Query-complexity cap in the SQL guard |
-| `API_TOKEN` | empty | Optional `Authorization: Bearer` for `/stats`, `/tickets`, `/query`. `/health` stays public |
-| `VITE_API_TOKEN` | empty | Same token for the React console. Leave empty when `API_TOKEN` is empty |
+| `API_TOKEN` | empty | Optional bearer auth for every non-public route. `/health`, `/metrics`, and OpenAPI stay public |
+| `VITE_API_TOKEN` | empty | Browser-visible demo token for the React console. Not a production secret |
 | `VITE_API_BASE_URL` | `/api` | Browser API prefix (Vite/nginx rewrite) |
 | `CORS_ORIGINS` | local Vite/preview | Comma-separated browser origins |
 
-Do not commit `.env`. `.env.example` is the template. If you set `API_TOKEN`, set `VITE_API_TOKEN` to the same value (Compose passes `API_TOKEN` into the web build when `VITE_API_TOKEN` is unset).
+Do not commit `.env`. `.env.example` is the template. If you set `API_TOKEN`, set `VITE_API_TOKEN` to the same value for the React console (Compose does this when `VITE_API_TOKEN` is unset). `VITE_*` values are compiled into the browser bundle, so this is optional demo protection, not secret management.
 
 ---
 
@@ -368,7 +368,7 @@ Dockerfile
 python -m pytest tests -q
 ```
 
-Last local run of that command: **43 passed**.
+Last local run of that command: **44 passed**.
 
 | File | What it locks in |
 | --- | --- |
@@ -378,7 +378,7 @@ Last local run of that command: **43 passed**.
 | `tests/test_nl_evaluation.py` | Golden questions: intended SQL semantics and verified numeric results, including NULLs |
 | `tests/test_date_windows.py` | this/last week and this/last month bind to `2024-03-30 18:06:00` |
 | `tests/test_llm_failures.py` | Invalid JSON, missing `sql`, DML, timeout fallback |
-| `tests/test_query_limits.py` | Row cap, bounded `fetchmany` (no `fetchall`), SQLite timeout, `/metrics` |
+| `tests/test_query_limits.py` | Row cap, bounded `fetchmany` (no `fetchall`), SELECT and COUNT(*) timeouts, `/metrics` |
 | `tests/test_auth.py` | Optional bearer token; `/health` remains public |
 | `tests/test_api_integration.py` | `/health`, `/stats`, `/anomalies` after ingest; `/query` is structured 200 or honest 503 |
 
@@ -391,7 +391,7 @@ Last local run of that command: **43 passed**.
 - **IQR and the 24h SLA are statistical defaults**, not DOTMappers’ real policy. They are config, not hidden constants.
 - **500-row SQLite + pandas at ingest is appropriate for this file.** Stats and ticket listing are SQL. A production warehouse (Postgres, pagination, no full-table pandas) would be required for hundreds of thousands of tickets.
 - **Groq free-tier rate limits are not queued.** Under burst load, `/query` would need a worker.
-- **Auth is optional.** Set `API_TOKEN` and `VITE_API_TOKEN` together. There is still no multi-tenancy or per-user isolation.
+- **Auth is optional demo protection.** `API_TOKEN` gates non-public API routes. `VITE_API_TOKEN` is baked into the React build and can be read from the browser. There is no multi-tenancy or per-user isolation.
 - **Anomaly explanations are rule strings**, not LLM write-ups. Detection never depends on Groq.
 - **Row cap is 50.** Generated SELECTs are wrapped with `LIMIT cap+1` and read with `fetchmany`. The exact match count uses `COUNT(*)` of the original SELECT so Python never holds the full result set.
 

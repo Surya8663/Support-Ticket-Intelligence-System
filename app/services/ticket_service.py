@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import pandas as pd
 
@@ -243,24 +245,11 @@ class TicketService:
     def _execute_select(self, sql: str) -> tuple[list[dict], int, float]:
         cap = self.settings.query_result_row_cap
         fetch_limit = cap + 1
-        bounded_sql = bound_select(sql, fetch_limit)
         started = time.perf_counter()
-        try:
-            with self._connect(
-                readonly=True,
-                timeout_seconds=self.settings.sql_timeout_seconds,
-            ) as conn:
-                cursor = conn.execute(bounded_sql)
-                columns = [col[0] for col in cursor.description] if cursor.description else []
-                fetched = cursor.fetchmany(fetch_limit)
-        except sqlite3.OperationalError as exc:
-            timed_out = "interrupt" in str(exc).lower()
-            metrics.record_sql((time.perf_counter() - started) * 1000, timed_out=timed_out)
-            if timed_out:
-                raise QueryTimeoutError(
-                    f"Query exceeded {self.settings.sql_timeout_seconds:.1f}s and was cancelled."
-                ) from exc
-            raise
+        with self._timed_readonly_connection() as conn:
+            cursor = conn.execute(bound_select(sql, fetch_limit))
+            columns = [col[0] for col in cursor.description] if cursor.description else []
+            fetched = cursor.fetchmany(fetch_limit)
         elapsed_ms = (time.perf_counter() - started) * 1000
         metrics.record_sql(elapsed_ms, timed_out=False)
         truncated = len(fetched) > cap
@@ -272,12 +261,29 @@ class TicketService:
         return rows, row_count, elapsed_ms
 
     def _count_matches(self, sql: str) -> int:
-        with self._connect(
-            readonly=True,
-            timeout_seconds=self.settings.sql_timeout_seconds,
-        ) as conn:
+        with self._timed_readonly_connection() as conn:
             row = conn.execute(count_select(sql)).fetchone()
         return int(row[0]) if row else 0
+
+    @contextmanager
+    def _timed_readonly_connection(self) -> Iterator[sqlite3.Connection]:
+        started = time.perf_counter()
+        conn = self._connect(
+            readonly=True,
+            timeout_seconds=self.settings.sql_timeout_seconds,
+        )
+        try:
+            yield conn
+        except sqlite3.OperationalError as exc:
+            timed_out = "interrupt" in str(exc).lower()
+            metrics.record_sql((time.perf_counter() - started) * 1000, timed_out=timed_out)
+            if timed_out:
+                raise QueryTimeoutError(
+                    f"Query exceeded {self.settings.sql_timeout_seconds:.1f}s and was cancelled."
+                ) from exc
+            raise
+        finally:
+            conn.close()
 
     def _connect(self, readonly: bool = True, timeout_seconds: float | None = None) -> sqlite3.Connection:
         return connect(

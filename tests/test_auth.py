@@ -24,9 +24,11 @@ def test_bearer_token_is_required_when_configured():
             denied = client.get("/stats")
             assert denied.status_code == 401
             assert denied.json()["error"] == "unauthorized"
+            assert client.get("/anomalies").status_code == 401
             allowed = client.get("/stats", headers={"Authorization": "Bearer assessment-secret"})
             assert allowed.status_code == 200
             assert client.get("/health").status_code == 200
+            assert client.get("/metrics").status_code == 200
             preflight = client.options("/stats")
             assert preflight.status_code != 401
     finally:

@@ -39,6 +39,31 @@ def test_retrieval_is_bounded_not_sliced_after_fetchall():
         assert count > len(rows)
 
 
+def test_count_matches_timeout_is_query_timeout_error():
+    with TestClient(app) as client:
+        service = app.state.service
+        original = service.settings.sql_timeout_seconds
+        service.settings.sql_timeout_seconds = 0.01
+        service.settings.sql_progress_check_every = 100
+        try:
+            try:
+                service._count_matches(
+                    """
+                    SELECT * FROM tickets a
+                    JOIN tickets b ON a.ticket_id IS NOT NULL
+                    JOIN tickets c ON b.ticket_id IS NOT NULL
+                    """
+                )
+            except QueryTimeoutError:
+                pass
+            else:
+                raise AssertionError("Expected QueryTimeoutError from COUNT(*)")
+        finally:
+            service.settings.sql_timeout_seconds = original
+            service.settings.sql_progress_check_every = 10_000
+        assert client.get("/metrics").json()["sql_timeouts"] >= 1
+
+
 def test_sql_timeout_cancels_expensive_query():
     with TestClient(app) as client:
         service = app.state.service
