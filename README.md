@@ -1,6 +1,7 @@
 # Support Ticket Intelligence System
-
+---
 **Deployed link** : https://support-ticket-intelligence-system.streamlit.app/
+---
 **DOTMappers AI Engineer assessment** — ingest a support-ticket CSV, answer natural-language questions, flag anomalies, and serve both a REST API and an operations console.
 
 The LLM is a **translation layer, not a compute engine**. Groq turns a question into SQLite and turns result rows back into prose. Counts, averages, filters, and anomaly scores are computed in deterministic Python so numbers cannot hallucinate.
