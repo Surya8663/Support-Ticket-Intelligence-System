@@ -70,6 +70,8 @@ Rules:
     (status = 'Resolved' AND resolution_time_hrs > N)
     OR (status IN ('Open', 'Escalated') AND age_hours > N)
 - Questions about anomalies / outliers / SLA breaches should query the anomalies table.
+- Ranking an agent (most / least / lowest / highest / best / worst) requires GROUP BY agent_id and an aggregate. Never ORDER BY a raw ticket column LIMIT 1 to name an agent.
+- "Lowest / highest / best / worst customer rating" for an agent is AVG(customer_rating) GROUP BY agent_id, excluding NULLs. Never use MIN(customer_rating) or MAX(customer_rating) on a single ticket to pick the agent.
 - Alias aggregated columns with clear names.
 - Return only JSON. No markdown.
 
