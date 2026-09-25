@@ -1,14 +1,17 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
     """Single source of configuration. Thresholds and paths live here, not in logic files."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(REPO_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -37,6 +40,15 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @model_validator(mode="after")
+    def resolve_data_paths(self) -> "Settings":
+        """Relative CSV/DB paths are repo-root based, not process-cwd based."""
+        if not self.csv_path.is_absolute():
+            self.csv_path = (REPO_ROOT / self.csv_path).resolve()
+        if not self.db_path.is_absolute():
+            self.db_path = (REPO_ROOT / self.db_path).resolve()
+        return self
 
 
 @lru_cache

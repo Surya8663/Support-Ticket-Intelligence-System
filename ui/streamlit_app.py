@@ -3,6 +3,17 @@
 from __future__ import annotations
 
 import html
+import os
+import sys
+from pathlib import Path
+
+# Streamlit Cloud runs this file from ui/, so the repo root is not on sys.path
+# unless we add it. Local `streamlit run ui/streamlit_app.py` has the same need
+# if the process cwd is not the project root.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+os.chdir(_ROOT)
 
 import streamlit as st
 
@@ -11,6 +22,22 @@ from app.llm.groq_client import GroqNotConfiguredError, GroqRequestError
 from app.nlquery.sql_guard import SQLGuardError
 from app.nlquery.text_to_sql import QueryTranslationError
 from app.services.ticket_service import TicketService
+
+
+def _copy_cloud_secrets() -> None:
+    """Streamlit Cloud secrets are not always exported as env vars."""
+    try:
+        secrets = st.secrets
+    except Exception:
+        return
+    for name in ("GROQ_API_KEY", "API_TOKEN"):
+        try:
+            value = secrets.get(name)
+        except Exception:
+            value = None
+        if value and not os.environ.get(name):
+            os.environ[name] = str(value)
+
 
 SAMPLES = [
     "How many tickets are currently open?",
@@ -276,6 +303,7 @@ details.sql-drawer[open] summary::after { transform: rotate(-135deg); margin-top
 
 @st.cache_resource
 def get_service() -> TicketService:
+    _copy_cloud_secrets()
     service = TicketService(get_settings())
     service.startup()
     return service
